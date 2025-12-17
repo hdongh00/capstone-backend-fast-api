@@ -11,7 +11,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.utils import get_authorization_scheme_param
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-# from langchain_google_genai import ChatGoogleGenerativeAI
 from pymongo import MongoClient
 from pytz import timezone
 from starlette.responses import StreamingResponse
@@ -26,7 +25,7 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 OPEN_AI_KEY = os.getenv("OPEN_AI_KEY")
 MONGODB_URI = os.getenv("MONGODB_URI")
 JWT_SECRET = os.getenv("JWT_SECRET")
-MODEL_PATH = "monologg/koelectra-base-v3-discriminator"
+MODEL_PATH = "LimYeri/HowRU-KoELECTRA-Emotion-Classifier"
 
 seoul_tz = timezone("Asia/Seoul")
 
@@ -42,12 +41,8 @@ app.add_middleware(
 client = MongoClient(MONGODB_URI)
 db = client["chatbot"]
 CHAT_COLLECTION = db["messages"]
-llm = ChatOpenAI(model="gpt-4.1-nano",openai_api_key=OPEN_AI_KEY)
-# llm = ChatGoogleGenerativeAI(
-#     model="gemini-2.5-flash",
-#     google_api_key=GOOGLE_API_KEY,
-#     temperature=0.3,
-# )
+
+llm = ChatOpenAI(model="gpt-4.1-nano", openai_api_key=OPEN_AI_KEY)
 
 prompt = ChatPromptTemplate.from_messages(
     [
@@ -79,33 +74,47 @@ summary_chain = summary_prompt | llm
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-emotion_model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH, num_labels=3).to(device)
+emotion_model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH).to(device)
 emotion_model.eval()
+ID2LABEL = emotion_model.config.id2label
 
-LABELS = ["부정", "중립", "긍정"]
-
-EMOTION_SCALE = {
-    1: "매우 나쁨",
-    2: "나쁨",
-    3: "조금 나쁨",
-    4: "약간 나쁨",
-    5: "보통",
-    6: "약간 좋음",
-    7: "좋음",
-    8: "매우 좋음",
+EMOTION_TO_SCORE_0_5 = {
+    "기쁨": 5,
+    "설렘": 4,
+    "평범함": 3,
+    "불쾌함": 2,
+    "슬픔": 2,
+    "놀라움": 1,
+    "두려움": 0,
+    "분노": 0,
 }
+
+SCORE_TO_WEATHER = {
+    0: "토네이도",
+    1: "번개",
+    2: "비",
+    3: "구름",
+    4: "맑음",
+    5: "최고",
+}
+
+def clamp_0_5(x: float) -> float:
+    return max(0.0, min(5.0, x))
+
+def score_to_weather(score: float) -> str:
+    s = int(round(score))
+    s = max(0, min(5, s))
+    return SCORE_TO_WEATHER[s]
 
 def get_token(authorization: str) -> str:
     scheme, token = get_authorization_scheme_param(authorization)
     return token
-
 
 def decode_jwt(authorization: str) -> int:
     token = get_token(authorization)
     payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
     user_code = payload.get("userCode")
     return int(user_code)
-
 
 async def get_body_and_user(request: Request, authorization: str):
     body = await request.json()
@@ -114,34 +123,32 @@ async def get_body_and_user(request: Request, authorization: str):
         body_data[b] = body.get(b)
     return body_data, decode_jwt(authorization)
 
-
-def get_emotion_label_from_score(score: float) -> str:
-    score_int = max(1, min(8, int(round(score))))
-    return EMOTION_SCALE.get(score_int, "알 수 없음")
-
-
 def analyze_emotion_score(text: str):
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=128).to(device)
+    inputs = tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        padding=True,
+        max_length=128
+    ).to(device)
+
     with torch.no_grad():
         outputs = emotion_model(**inputs)
 
     probabilities = torch.softmax(outputs.logits, dim=1)[0]
-    probs = probabilities.tolist()
+    probs_list = probabilities.tolist()
 
-    scale_score = round(probs[0] * 2 + probs[1] * 5 + probs[2] * 8, 2)
+    pred_id = int(torch.argmax(probabilities).item())
+    predicted_label = ID2LABEL[pred_id]
 
-    sorted_probs, indices = torch.sort(probabilities, descending=True)
-    predicted_label = "중립" if (sorted_probs[0] - sorted_probs[1]) < 0.03 else LABELS[indices[0].item()]
-
-    scores = {LABELS[i]: round(p * 100, 2) for i, p in enumerate(probs)}
+    score_0_5 = clamp_0_5(float(EMOTION_TO_SCORE_0_5.get(predicted_label, 3)))
+    scores = {ID2LABEL[i]: round(p * 100, 2) for i, p in enumerate(probs_list)}
 
     return {
         "예측": predicted_label,
         "확률": scores,
-        "척도값": scale_score,
-        "척도 해석": get_emotion_label_from_score(scale_score),
+        "척도값": score_0_5,
     }
-
 
 @app.post("/chat")
 async def chat(request: Request, authorization: str = Header(...)):
@@ -166,11 +173,10 @@ async def chat(request: Request, authorization: str = Header(...)):
 
     return StreamingResponse(get_streaming_response(), media_type="text/plain")
 
-
 @app.post("/summary")
 async def summary(request: Request, authorization: str = Header(...)):
     req, user_code = await get_body_and_user(request, authorization)
-    conv_id, year, month, day = (req["convId"],req["year"],req["month"],req["day"])
+    conv_id, year, month, day = (req["convId"], req["year"], req["month"], req["day"])
 
     history = MessagesCollectionHistory(CHAT_COLLECTION, user_code, conv_id)
     past = history.get_messages(year=year, month=month, day=day)
@@ -203,7 +209,6 @@ async def summary(request: Request, authorization: str = Header(...)):
 
     return summary_text
 
-
 @app.post("/analyze")
 async def analyze(request: Request, authorization: str = Header(...)):
     req, user_code = await get_body_and_user(request, authorization)
@@ -214,7 +219,6 @@ async def analyze(request: Request, authorization: str = Header(...)):
 
     user_utterances = [msg.content for msg in messages if isinstance(msg, HumanMessage)]
     if not user_utterances:
-        print("사용자 대화 없음")
         return {"message": "분석할 사용자 대화가 없습니다.", "result": None}
 
     analysis_results = []
@@ -230,22 +234,23 @@ async def analyze(request: Request, authorization: str = Header(...)):
                 "probs": analysis["확률"],
             }
         )
-        total_scale_score += analysis["척도값"]
+        total_scale_score += float(analysis["척도값"])
 
-    avg_scale_score = total_scale_score / len(user_utterances)
-    overall_emotion_label = get_emotion_label_from_score(avg_scale_score)
+    avg_scale_score = clamp_0_5(total_scale_score / len(user_utterances))
+    final_score = round(avg_scale_score, 2)
+    overall_emotion_label = score_to_weather(final_score)
 
     repo = MariaAnalysisRepo()
     target_date = datetime.now(seoul_tz).date()
     create_at = datetime.now(seoul_tz).replace(tzinfo=None)
 
     latest = repo.get_latest_by_user_and_date(user_code=user_code, target_date=target_date)
-    print(avg_scale_score)
+
     if latest and latest.get("analysis_code"):
         summary_keep = None if latest.get("summary") is None else latest.get("summary")
         repo.update(
             analysis_code=int(latest["analysis_code"]),
-            emotion_score=round((avg_scale_score/2), 2),
+            emotion_score=final_score,
             emotion_name=overall_emotion_label,
             summary=summary_keep,
             create_at=create_at,
@@ -253,7 +258,7 @@ async def analyze(request: Request, authorization: str = Header(...)):
     else:
         repo.insert(
             user_code=user_code,
-            emotion_score=round((avg_scale_score / 2), 2),
+            emotion_score=final_score,
             emotion_name=overall_emotion_label,
             summary=None,
             create_at=create_at,
@@ -265,11 +270,10 @@ async def analyze(request: Request, authorization: str = Header(...)):
         "utterance_count": len(user_utterances),
         "details": analysis_results,
         "overall_stats": {
-            "average_scale_score": round(avg_scale_score, 2),
+            "average_scale_score": final_score,
             "overall_emotion": overall_emotion_label,
         },
     }
-
-
+    
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
