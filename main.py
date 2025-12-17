@@ -67,7 +67,7 @@ summary_prompt = ChatPromptTemplate.from_messages(
             "system",
             "너는 이 history 대화를 모두 요약하여 철저히 사용자의 시선에서 한 편의 일기를 써야하는 일기 마스터이다. "
             "어투는 오늘은 ~ 했다 또는 ~가 있었다 등 과거형으로 집필해야하며, "
-            "안좋은 내용이 있더라도 객관적으로 작성해야한다.",
+            "안좋은 내용이 있더라도 객관적으로 작성해야한다. 또한 대화를 한 것을 요약하여 일기를 작성하는 것이 아니라, user가 무슨 일을 겪고, 어떤 일이 있었는지 등으로 작성해야 한다.",
         ),
         MessagesPlaceholder("history"),
         ("human", "이 history를 기반으로 모두 대화를 요약하고, 내 관점에서 일기를 작성해줘."),
@@ -201,12 +201,7 @@ async def summary(request: Request, authorization: str = Header(...)):
             create_at=create_at,
         )
 
-    return {
-        "message": "저장",
-        "userCode": user_code,
-        "convId": conv_id,
-        "summary": summary_text,
-    }
+    return summary_text
 
 
 @app.post("/analyze")
